@@ -2,64 +2,59 @@ import { Router } from 'express'
 import multer from 'multer'
 import fs from 'fs'
 import {
-  saveVoiceSample,
-  synthesizeWithClone,
-  getVoiceCloneStatus,
-  clearUserSamples,
-  getUserSamples,
+  saveVoiceSample, synthesizeWithClone,
+  getVoiceCloneStatus, clearUserSamples, getUserSamples,
 } from '../voice/voiceClone.js'
 
 const router = Router()
 
-const storage = multer.memoryStorage()
 const upload = multer({
-  storage,
-  limits: { fileSize: 10 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
-    if (file.originalname.match(/\.(wav|mp3|ogg|webm)$/i)) cb(null, true)
-    else cb(new Error('Faqat audio fayl (wav, mp3, ogg, webm)'))
+    if (file.originalname.match(/\.(wav|mp3|ogg|webm|m4a)$/i) || file.mimetype.startsWith('audio/'))
+      cb(null, true)
+    else cb(new Error('Faqat audio fayl qabul qilinadi'))
   },
 })
 
 // GET /api/voice/status
 router.get('/status', async (req, res) => {
-  const userId = req.query.userId || 'default'
-  const status = await getVoiceCloneStatus(userId)
+  const status = await getVoiceCloneStatus(req.query.userId || 'default')
   res.json(status)
 })
 
-// POST /api/voice/sample — ovoz namunasi yuklash
+// POST /api/voice/sample  — namuna yuklash
 router.post('/sample', upload.single('audio'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Audio fayl yuklang' })
   const userId = req.body.userId || 'default'
   const existing = getUserSamples(userId)
-  const sampleIndex = existing.length + 1
   try {
-    const filepath = await saveVoiceSample(req.file.buffer, userId, sampleIndex)
+    const fp = await saveVoiceSample(req.file.buffer, userId, existing.length + 1)
     const status = await getVoiceCloneStatus(userId)
-    res.json({ success: true, message: `Namuna ${sampleIndex} saqlandi`, filepath, status })
+    res.json({ success: true, message: `Namuna ${existing.length+1} saqlandi`, filepath: fp, status })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
 })
 
-// POST /api/voice/synthesize — matn → klonlangan ovoz
+// POST /api/voice/synthesize  — klonlangan ovoz
 router.post('/synthesize', async (req, res) => {
   const { text, userId = 'default', language = 'en' } = req.body
   if (!text) return res.status(400).json({ error: 'text required' })
   try {
-    const outputFile = await synthesizeWithClone(text, userId, language)
-    if (!outputFile || !fs.existsSync(outputFile)) {
+    const outFile = await synthesizeWithClone(text, userId, language)
+    if (!outFile || !fs.existsSync(outFile)) {
       return res.status(500).json({
         error: 'Ovoz sintezi muvaffaqiyatsiz',
-        tip: 'pip install TTS && tts-server --model_name tts_models/multilingual/multi-dataset/xtts_v2',
+        fix: 'pip install TTS && tts-server --model_name tts_models/multilingual/multi-dataset/xtts_v2',
       })
     }
     res.setHeader('Content-Type', 'audio/wav')
-    res.setHeader('Content-Disposition', 'inline; filename="speech.wav"')
-    const stream = fs.createReadStream(outputFile)
+    res.setHeader('Content-Disposition', 'inline; filename="azim_speech.wav"')
+    const stream = fs.createReadStream(outFile)
     stream.pipe(res)
-    res.on('finish', () => { try { fs.unlinkSync(outputFile) } catch {} })
+    res.on('finish', () => { try { fs.unlinkSync(outFile) } catch {} })
   } catch (err) {
     res.status(500).json({ error: err.message })
   }
@@ -67,18 +62,13 @@ router.post('/synthesize', async (req, res) => {
 
 // DELETE /api/voice/samples
 router.delete('/samples', (req, res) => {
-  const userId = req.query.userId || 'default'
-  const count = clearUserSamples(userId)
-  res.json({ success: true, deleted: count })
+  const n = clearUserSamples(req.query.userId || 'default')
+  res.json({ success: true, deleted: n })
 })
 
-router.get('/tts', (_req, res) => {
-  res.json({
-    engine: 'XTTS v2 (zero-shot voice cloning)',
-    install: 'pip install TTS',
-    startServer: 'tts-server --model_name tts_models/multilingual/multi-dataset/xtts_v2',
-    language: process.env.VOICE_LANGUAGE || 'uz-UZ',
-  })
-})
+router.get('/tts', (_req, res) => res.json({
+  engine: 'XTTS v2', install: 'pip install TTS',
+  start: 'tts-server --model_name tts_models/multilingual/multi-dataset/xtts_v2 --port 5002',
+}))
 
 export default router

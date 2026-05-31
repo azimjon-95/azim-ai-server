@@ -6,152 +6,129 @@ import axios from 'axios'
 
 const execAsync = promisify(exec)
 
-const VOICE_DIR = path.resolve('voices')
+const VOICE_DIR  = path.resolve('voices')
 const SAMPLES_DIR = path.join(VOICE_DIR, 'samples')
-const MODELS_DIR = path.join(VOICE_DIR, 'models')
-const OUTPUT_DIR = path.join(VOICE_DIR, 'output')
+const OUTPUT_DIR  = path.join(VOICE_DIR, 'output')
 
-// Create directories if not exist
-for (const dir of [VOICE_DIR, SAMPLES_DIR, MODELS_DIR, OUTPUT_DIR]) {
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+for (const d of [VOICE_DIR, SAMPLES_DIR, OUTPUT_DIR]) {
+  if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true })
 }
 
-// ─── COQUI TTS (XTTS v2) ─────────────────────────────────────────────────────
-// XTTS v2 supports zero-shot voice cloning with just 3-10 seconds of audio
+const COQUI = process.env.COQUI_API_URL || 'http://localhost:5002'
+const XTTS_MODEL = 'tts_models/multilingual/multi-dataset/xtts_v2'
 
-const COQUI_API = process.env.COQUI_API_URL || 'http://localhost:5002'
-
-/**
- * Check if Coqui TTS server is running
- */
-export const getCoquiStatus = async () => {
+// ── Save uploaded webm/wav sample ──────────────────────────────────────────
+export const saveVoiceSample = async (buffer, userId = 'default', idx = 1) => {
+  const file = path.join(SAMPLES_DIR, `${userId}_sample_${idx}.webm`)
+  fs.writeFileSync(file, buffer)
+  // Convert webm → wav using ffmpeg if available
+  const wav = file.replace('.webm', '.wav')
   try {
-    const res = await axios.get(`${COQUI_API}/api/tts`, { timeout: 3000 })
-    return { running: true, url: COQUI_API }
+    await execAsync(`ffmpeg -y -i "${file}" -ar 22050 -ac 1 "${wav}" 2>/dev/null`)
+    fs.unlinkSync(file)          // remove original webm
+    console.log(`[Voice] Saved + converted: ${path.basename(wav)}`)
+    return wav
   } catch {
-    return { running: false, url: COQUI_API }
+    // ffmpeg not available — keep webm
+    console.log(`[Voice] Saved (no ffmpeg): ${path.basename(file)}`)
+    return file
   }
 }
 
-/**
- * Save uploaded voice sample
- * @param {Buffer} audioBuffer - Audio file buffer (wav/mp3)
- * @param {string} userId - User identifier
- * @param {number} sampleIndex - Sample number (1,2,3...)
- */
-export const saveVoiceSample = async (audioBuffer, userId = 'default', sampleIndex = 1) => {
-  const filename = `${userId}_sample_${sampleIndex}.wav`
-  const filepath = path.join(SAMPLES_DIR, filename)
-  fs.writeFileSync(filepath, audioBuffer)
-  console.log(`[Voice] Sample saved: ${filename}`)
-  return filepath
+export const getUserSamples = (userId = 'default') =>
+  fs.readdirSync(SAMPLES_DIR)
+    .filter(f => f.startsWith(userId))
+    .map(f => path.join(SAMPLES_DIR, f))
+
+export const clearUserSamples = (userId = 'default') => {
+  const files = getUserSamples(userId)
+  files.forEach(f => { try { fs.unlinkSync(f) } catch {} })
+  return files.length
 }
 
-/**
- * Get all samples for a user
- */
-export const getUserSamples = (userId = 'default') => {
-  const files = fs.readdirSync(SAMPLES_DIR)
-  return files
-    .filter((f) => f.startsWith(userId))
-    .map((f) => path.join(SAMPLES_DIR, f))
+// ── Synthesize using XTTS v2 (CLI) ─────────────────────────────────────────
+const synthCLI = async (text, speakerWav, language, outFile) => {
+  const cmd = [
+    'tts',
+    `--text "${text.replace(/"/g,"'")}"`,
+    `--model_name ${XTTS_MODEL}`,
+    `--speaker_wav "${speakerWav}"`,
+    `--language_idx "${language}"`,
+    `--out_path "${outFile}"`,
+  ].join(' ')
+  await execAsync(cmd, { timeout: 60000 })
+  return outFile
 }
 
-/**
- * Synthesize speech using XTTS v2 voice cloning
- * Uses user's voice sample as reference — speaks in their voice!
- *
- * @param {string} text - Text to speak
- * @param {string} userId - User ID to get voice sample
- * @param {string} language - Language code (uz, en, ru...)
- */
+// ── Synthesize using Coqui TTS HTTP server ─────────────────────────────────
+const synthAPI = async (text, speakerWav, language, outFile) => {
+  const FormData = (await import('form-data')).default
+  const form = new FormData()
+  form.append('text', text)
+  form.append('language_id', language)
+  form.append('speaker_wav', fs.createReadStream(speakerWav), { filename: 'speaker.wav' })
+
+  const res = await axios.post(`${COQUI}/api/tts`, form, {
+    headers: form.getHeaders(),
+    responseType: 'arraybuffer',
+    timeout: 45000,
+  })
+  fs.writeFileSync(outFile, Buffer.from(res.data))
+  return outFile
+}
+
+// ── Espeak fallback ─────────────────────────────────────────────────────────
+const synthEspeak = async (text, language, outFile) => {
+  const lang = { uz:'uz', en:'en', ru:'ru' }[language] || 'en'
+  await execAsync(`espeak -v ${lang} -w "${outFile}" "${text.replace(/"/g,"'")}"`, { timeout: 10000 })
+  return outFile
+}
+
 export const synthesizeWithClone = async (text, userId = 'default', language = 'en') => {
   const samples = getUserSamples(userId)
+  const outFile = path.join(OUTPUT_DIR, `${userId}_${Date.now()}.wav`)
 
   if (samples.length === 0) {
-    console.warn('[Voice] No voice samples found, using default TTS')
-    return synthesizeDefault(text, language)
+    console.warn('[Voice] No samples — using espeak fallback')
+    try { return await synthEspeak(text, language, outFile) } catch { return null }
   }
 
-  // Use first sample as reference speaker
-  const speakerWav = samples[0]
-  const outputFile = path.join(OUTPUT_DIR, `${userId}_${Date.now()}.wav`)
+  const speaker = samples[0]
 
+  // 1. Try Coqui HTTP API (fastest if server running)
   try {
-    // XTTS v2 via command line (if installed locally)
-    const cmd = [
-      'tts',
-      `--text "${text.replace(/"/g, "'")}"`,
-      '--model_name tts_models/multilingual/multi-dataset/xtts_v2',
-      `--speaker_wav "${speakerWav}"`,
-      `--language_idx "${language}"`,
-      `--out_path "${outputFile}"`,
-    ].join(' ')
-
-    await execAsync(cmd, { timeout: 30000 })
-    console.log(`[Voice] Cloned speech generated: ${outputFile}`)
-    return outputFile
-  } catch (err) {
-    console.error('[Voice] XTTS failed:', err.message)
-    // Fallback: try Coqui API server
-    return synthesizeViaCoquiAPI(text, speakerWav, language, outputFile)
+    return await synthAPI(text, speaker, language, outFile)
+  } catch (e) {
+    console.warn('[Voice] Coqui API unavailable:', e.message)
   }
-}
 
-/**
- * Synthesize via Coqui TTS API server
- */
-const synthesizeViaCoquiAPI = async (text, speakerWav, language, outputFile) => {
+  // 2. Try XTTS CLI
   try {
-    const formData = new FormData()
-    formData.append('text', text)
-    formData.append('language_id', language)
-    formData.append('speaker_wav', fs.createReadStream(speakerWav))
-
-    const res = await axios.post(`${COQUI_API}/api/tts`, formData, {
-      responseType: 'arraybuffer',
-      timeout: 20000,
-    })
-
-    fs.writeFileSync(outputFile, Buffer.from(res.data))
-    return outputFile
-  } catch (err) {
-    console.error('[Voice] Coqui API failed:', err.message)
-    return null
+    return await synthCLI(text, speaker, language, outFile)
+  } catch (e) {
+    console.warn('[Voice] XTTS CLI unavailable:', e.message)
   }
-}
 
-/**
- * Default TTS without voice clone (espeak fallback)
- */
-const synthesizeDefault = async (text, language = 'en') => {
-  const outputFile = path.join(OUTPUT_DIR, `default_${Date.now()}.wav`)
+  // 3. Espeak fallback
   try {
-    const lang = language === 'uz' ? 'uz' : language === 'ru' ? 'ru' : 'en'
-    await execAsync(`espeak -v ${lang} -w "${outputFile}" "${text.replace(/"/g, "'")}"`)
-    return outputFile
+    return await synthEspeak(text, language, outFile)
   } catch {
     return null
   }
 }
 
-/**
- * Delete all samples for a user (retrain)
- */
-export const clearUserSamples = (userId = 'default') => {
-  const samples = getUserSamples(userId)
-  samples.forEach((f) => fs.unlinkSync(f))
-  console.log(`[Voice] Cleared ${samples.length} samples for user: ${userId}`)
-  return samples.length
+export const getCoquiStatus = async () => {
+  try {
+    await axios.get(`${COQUI}/api/tts`, { timeout: 2500 })
+    return { running: true, url: COQUI }
+  } catch {
+    return { running: false, url: COQUI }
+  }
 }
 
-/**
- * Get voice clone status for user
- */
 export const getVoiceCloneStatus = async (userId = 'default') => {
   const samples = getUserSamples(userId)
   const coqui = await getCoquiStatus()
-
   return {
     userId,
     samplesCount: samples.length,
@@ -160,11 +137,11 @@ export const getVoiceCloneStatus = async (userId = 'default') => {
     coquiRunning: coqui.running,
     coquiUrl: coqui.url,
     engine: 'XTTS v2 (zero-shot voice cloning)',
-    supportedLanguages: ['uz', 'en', 'ru', 'tr', 'de', 'fr', 'es', 'ar'],
+    supportedLanguages: ['uz','en','ru','tr','de','fr','es','ar'],
     instructions: samples.length === 0
-      ? "Ovoz namunasi yuklang (3-10 soniya audio)"
+      ? '3-10 soniyalik ovoz namunasi yuklang'
       : samples.length < 3
-      ? `${3 - samples.length} ta yana namuna yuklang (sifat yaxshilanadi)`
-      : "Ovoz klonlash tayyor! TTS ishlatishingiz mumkin.",
+      ? `${3-samples.length} ta yana namuna yuklang (sifat oshadi)`
+      : 'Tayyor! AI sizning ovozingizda gapiradi.',
   }
 }
